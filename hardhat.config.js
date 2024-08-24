@@ -15,6 +15,7 @@ module.exports = {
     paths: [
       "@openzeppelin/contracts/interfaces/IERC20.sol",
       "@account-abstraction/contracts/samples/SimpleAccountFactory.sol",
+      "@ensuro/swaplibrary/contracts/SwapLibrary.sol",
     ],
   },
 };

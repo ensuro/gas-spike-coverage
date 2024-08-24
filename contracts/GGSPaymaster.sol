@@ -10,7 +10,9 @@ import "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
 import "@account-abstraction/contracts/core/BasePaymaster.sol";
 import "@account-abstraction/contracts/core/Helpers.sol";
 
-import {SignedBucketRiskModule} from "./dependencies/SignedBucketRiskModule.sol";
+import {SignedBucketRiskModule} from "./dependencies/ensuro/SignedBucketRiskModule.sol";
+import {SwapLibrary} from "@ensuro/swaplibrary/contracts/SwapLibrary.sol";
+import {IWETH9} from "./dependencies/uniswap-v3/IWETH9.sol";
 
 /// @title Sample ERC-20 Token Paymaster for ERC-4337
 /// This Paymaster covers gas fees in exchange for ERC20 tokens charged using allowance pre-issued by ERC-4337 accounts.
@@ -25,19 +27,37 @@ import {SignedBucketRiskModule} from "./dependencies/SignedBucketRiskModule.sol"
 /// @dev Inherits from BasePaymaster.
 contract GSCPaymaster is BasePaymaster {
   using UserOperationLib for PackedUserOperation;
+  using SwapLibrary for SwapLibrary.SwapConfig;
 
   event UserOperationSponsored(address indexed user, uint256 actualGasCost);
 
   event Received(address indexed sender, uint256 value);
 
-  SignedBucketRiskModule riskModule;
+  SignedBucketRiskModule public immutable riskModule;
 
+  // TODO: this will track the actual gas accounting
+  struct GasUsed {
+    uint32 expiration;
+    uint256 foo;
+    uint256 bar;
+  }
+
+  mapping(uint256 => GasUsed) internal _gasStatus;
+  mapping(uint256 => SignedBucketRiskModule.PolicyData) internal _policies;
+
+  SwapLibrary.SwapConfig public swapConfig;
+  IWETH9 public immutable weth;
+
+  event SwapConfigChanged(SwapLibrary.SwapConfig swapConfig);
+  
   /// @notice Initializes the TokenPaymaster contract with the given parameters.
   /// @param _entryPoint The EntryPoint contract used in the Account Abstraction infrastructure.
   /// @param _riskModule The Ensuro riskModule that will cover the gas spikes
   /// @param _owner The address that will be set as the owner of the contract.
-  constructor(IEntryPoint _entryPoint, SignedBucketRiskModule _riskModule, address _owner) BasePaymaster(_entryPoint) {
-    _riskModule = riskModule;
+  constructor(IEntryPoint _entryPoint, SignedBucketRiskModule _riskModule, SwapLibrary.SwapConfig memory _swapConfig, IWETH9 _weth, address _owner) BasePaymaster(_entryPoint) {
+    riskModule = _riskModule;
+    weth = _weth;
+    _setSwapConfig(_swapConfig);
     transferOwnership(_owner);
   }
 
@@ -73,5 +93,15 @@ contract GSCPaymaster is BasePaymaster {
   function withdrawEth(address payable recipient, uint256 amount) external onlyOwner {
     (bool success, ) = recipient.call{value: amount}("");
     require(success, "withdraw failed");
+  }
+
+  function _setSwapConfig(SwapLibrary.SwapConfig memory newSwapConfig) internal {
+    newSwapConfig.validate();
+    swapConfig = newSwapConfig;
+    emit SwapConfigChanged(swapConfig);
+  }
+
+  function setSwapConfig(SwapLibrary.SwapConfig memory newSwapConfig) external onlyOwner {
+    _setSwapConfig(newSwapConfig);
   }
 }

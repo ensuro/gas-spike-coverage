@@ -1,6 +1,7 @@
 const { expect } = require("chai");
 const { _W, getRole, amountFunction, getAddress, grantComponentRole } = require("@ensuro/core/js/utils");
 const { setupChain, initForkCurrency } = require("@ensuro/core/js/test-utils");
+const { buildUniswapConfig } = require("@ensuro/swaplibrary/js/utils");
 const hre = require("hardhat");
 const helpers = require("@nomicfoundation/hardhat-network-helpers");
 
@@ -18,13 +19,21 @@ const ADDRESSES = {
   RM_GSC: "0xb957202C0b07d78924F724a65FdD1d3E70734f8e",
   USDCWhale: "0xf89d7b9c864f589bbF53a82105107622B35EaA40",
   ENTRYPOINT: "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+  SWAP_ROUTER: "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+  WETH: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
 };
 
 async function setUp() {
   const [, eoa1, eoa2, anon, owner, pricer] = await ethers.getSigners();
 
   const ep = await ethers.getContractAt("IEntryPoint", ADDRESSES.ENTRYPOINT);
-  const GSCPaymaster = await ethers.getContractFactory("GSCPaymaster");
+
+  // SwapLibrary setup
+  const SwapLibrary = await ethers.getContractFactory("SwapLibrary");
+  const deployedSwapLibrary = await SwapLibrary.deploy();
+  const swapAddr = await ethers.resolveAddress(deployedSwapLibrary);
+
+  const GSCPaymaster = await ethers.getContractFactory("GSCPaymaster", { libraries: { SwapLibrary: swapAddr } });
 
   // Setup some accounts
   const SimpleAccountFactory = await ethers.getContractFactory("SimpleAccountFactory");
@@ -45,6 +54,10 @@ async function setUp() {
   // Airdrop some USDC for tests
   const usdc = await initForkCurrency(ADDRESSES.USDC, ADDRESSES.USDCWhale, [acc1, acc2], [_A(100), _A(100)]);
 
+  const FEETIER = 500;
+  const swapConfig = buildUniswapConfig(_W("0.005"), FEETIER, ADDRESSES.SWAP_ROUTER);
+  const pm = await GSCPaymaster.deploy(ADDRESSES.ENTRYPOINT, rm, swapConfig, ADDRESSES.WETH, owner);
+
   return {
     ep,
     GSCPaymaster,
@@ -62,6 +75,7 @@ async function setUp() {
     pricer,
     ensAdmin,
     usdc,
+    pm,
   };
 }
 
