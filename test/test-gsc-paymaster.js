@@ -1,5 +1,14 @@
 const { expect } = require("chai");
-const { _W, getRole, amountFunction, getAddress, grantComponentRole } = require("@ensuro/core/js/utils");
+const {
+  _W,
+  getRole,
+  amountFunction,
+  getAddress,
+  grantComponentRole,
+  defaultPolicyParams,
+  makeSignedQuote,
+  makeBucketQuoteMessage,
+} = require("@ensuro/core/js/utils");
 const { setupChain, initForkCurrency } = require("@ensuro/core/js/test-utils");
 const { buildUniswapConfig } = require("@ensuro/swaplibrary/js/utils");
 const hre = require("hardhat");
@@ -23,6 +32,9 @@ const ADDRESSES = {
   WETH: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
   ETH_USD_ORACLE: "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612",
 };
+
+const ERC20_TRANSFER_GAS = 65000n; // Approx
+const ORACLE_TO_WAD = 10n ** 10n;
 
 async function setUp() {
   const [, eoa1, eoa2, anon, owner, pricer] = await ethers.getSigners();
@@ -57,8 +69,11 @@ async function setUp() {
   const usdc = await initForkCurrency(ADDRESSES.USDC, ADDRESSES.USDCWhale, [acc1, acc2], [_A(100), _A(100)]);
 
   const FEETIER = 500;
-  const swapConfig = buildUniswapConfig(_W("0.005"), FEETIER, ADDRESSES.SWAP_ROUTER);
+  const swapConfig = buildUniswapConfig(_W("0.01"), FEETIER, ADDRESSES.SWAP_ROUTER);
   const pm = await GSCPaymaster.deploy(ADDRESSES.ENTRYPOINT, rm, swapConfig, ADDRESSES.WETH, oracle, owner);
+
+  await grantComponentRole(hre, access.connect(ensAdmin), rm, "POLICY_CREATOR_ROLE", pm);
+  await grantComponentRole(hre, access.connect(ensAdmin), rm, "RESOLVER_ROLE", pm);
 
   return {
     ep,
@@ -78,15 +93,56 @@ async function setUp() {
     ensAdmin,
     usdc,
     pm,
+    oracle,
   };
 }
 
 describe("GSCPaymaster contract tests", function () {
   before(async () => {
-    await setupChain(null);
+    await setupChain(246353581);
   });
 
-  it("Constructs with the right permissions and EP", async () => {
-    const { usdc, pool } = await helpers.loadFixture(setUp);
+  it("Checks price computations are correct", async () => {
+    const { pm } = await helpers.loadFixture(setUp);
+    expect(await pm.getPriceCurrencyInEth()).to.be.closeTo(_W("0.000363"), _W("0.000005"));
+    expect(await pm.getPriceEthInCurrency()).to.be.closeTo(_W("2754.41"), _W("0.5"));
+  });
+
+  it("Creates a policy", async () => {
+    const { usdc, pool, pm, eoa1, acc1, rm, oracle, pricer } = await helpers.loadFixture(setUp);
+    const gasLimit = ERC20_TRANSFER_GAS * 20n;
+    const prePaidGasPrice = ethers.parseUnits("0.5", "gwei");
+    const limitGasPrice = ethers.parseUnits("1.5", "gwei");
+    const appreciationFactor = _W("1.2");
+    const reasonablePrioPerc = _W("0.1");
+
+    const coverageInput = [gasLimit, acc1, prePaidGasPrice, limitGasPrice, reasonablePrioPerc];
+
+    const policyData = await pm.computePolicyDataHash(coverageInput);
+    const payout = ((limitGasPrice - prePaidGasPrice) * gasLimit * appreciationFactor) / _W(1);
+    const price = (await oracle.latestRoundData()).answer * ORACLE_TO_WAD;
+    const payoutInUSDC = (payout * price) / _W(1) / 10n ** 12n;
+    const premium = _A(1);
+    const lossProb = _W("0.05");
+
+    const policyParams = await defaultPolicyParams({ rm, payout: payoutInUSDC, premium, lossProb, policyData });
+    policyParams.bucketId = 0;
+    const signature = await makeSignedQuote(pricer, policyParams, makeBucketQuoteMessage);
+
+    const policyInput = [
+      policyParams.payout,
+      policyParams.premium,
+      policyParams.lossProb,
+      policyParams.expiration,
+      policyParams.bucketId,
+      signature.r,
+      signature.yParityAndS,
+      policyParams.validUntil,
+    ];
+
+    const premiunInEth = await pm.getPriceCurrencyInEth();
+    const ethToSend = prePaidGasPrice * gasLimit + premiunInEth + (premiunInEth * _W("0.05")) / _W(1);
+
+    await pm.connect(eoa1).newPolicy(policyInput, coverageInput, { value: ethToSend });
   });
 });

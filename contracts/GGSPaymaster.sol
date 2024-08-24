@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
+import "@openzeppelin/contracts/interfaces/IERC721Receiver.sol";
 
 import "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
 import "@account-abstraction/contracts/core/BasePaymaster.sol";
@@ -14,6 +15,7 @@ import "@account-abstraction/contracts/core/Helpers.sol";
 import {SignedBucketRiskModule} from "./dependencies/ensuro/SignedBucketRiskModule.sol";
 import {IPolicyPool} from "./dependencies/ensuro/IPolicyPool.sol";
 import {IRiskModule} from "@ensuro/core/contracts/interfaces/IRiskModule.sol";
+import {IPolicyHolder} from "@ensuro/core/contracts/interfaces/IPolicyHolder.sol";
 import {Policy} from "./dependencies/ensuro/Policy.sol";
 import {SwapLibrary} from "@ensuro/swaplibrary/contracts/SwapLibrary.sol";
 import {IWETH9} from "./dependencies/uniswap-v3/IWETH9.sol";
@@ -30,7 +32,7 @@ import {EACAggregatorProxy} from "./dependencies/chainlink/EACAggregatorProxy.so
 /// It also allows updating price configuration and withdrawing tokens by the contract owner.
 /// The contract uses an Oracle to fetch the latest token prices.
 /// @dev Inherits from BasePaymaster.
-contract GSCPaymaster is BasePaymaster {
+contract GSCPaymaster is BasePaymaster, IPolicyHolder {
   using UserOperationLib for PackedUserOperation;
   using SwapLibrary for SwapLibrary.SwapConfig;
 
@@ -81,6 +83,14 @@ contract GSCPaymaster is BasePaymaster {
 
   error OraclePriceTooOld(uint256 updatedAt);
   error NotEnoughEthPaid(uint256 premiumInEth, uint256 left);
+  error OnlyPolicyPoolCanCallThis(address msgSender);
+  error ERC721TransfersNotAllowed();
+  error ShouldntHappen();
+
+  modifier onlyPolicyPool() {
+    if (msg.sender != address(_policyPool())) revert OnlyPolicyPoolCanCallThis(msg.sender);
+    _;
+  }
 
   /// @notice Initializes the TokenPaymaster contract with the given parameters.
   /// @param _entryPoint The EntryPoint contract used in the Account Abstraction infrastructure.
@@ -145,7 +155,7 @@ contract GSCPaymaster is BasePaymaster {
     _setSwapConfig(newSwapConfig);
   }
 
-  function getPriceCurrencyinEth() public view returns (uint256 price) {
+  function getPriceCurrencyInEth() public view returns (uint256 price) {
     return Math.mulDiv(WAD, WAD, getPriceEthInCurrency());
   }
 
@@ -155,8 +165,12 @@ contract GSCPaymaster is BasePaymaster {
     price = uint256(answer) * (10 ** (18 - oracle.decimals()));
   }
 
+  function _policyPool() internal view returns (IPolicyPool) {
+    return IPolicyPool(riskModule.policyPool());
+  }
+
   function _currency() internal view returns (address) {
-    return IPolicyPool(riskModule.policyPool()).currency();
+    return _policyPool().currency();
   }
 
   function computePolicyDataHash(CoverageInput memory coverageInput) public view returns (bytes32) {
@@ -167,10 +181,10 @@ contract GSCPaymaster is BasePaymaster {
     // Get the currency() to pay the premium
     weth.deposit{value: msg.value}();
     uint256 premiumInEth = swapConfig.exactOutput(
-      _currency(),
       address(weth),
+      _currency(),
       policyInput.premium,
-      getPriceCurrencyinEth()
+      getPriceCurrencyInEth()
     );
     weth.withdraw(msg.value - premiumInEth);
 
@@ -228,7 +242,54 @@ contract GSCPaymaster is BasePaymaster {
     _policies[policyId].jrCoc = premiumComposition.jrCoc;
     _policies[policyId].purePremium = premiumComposition.purePremium;
     _policies[policyId].ensuroCommission = premiumComposition.ensuroCommission;
-    _policies[policyId].partnerCommission = premiumComposition.partnerCommission;
-    require(Policy.hash(_policies[policyId]) == IPolicyPool(riskModule.policyPool()).getPolicyHash(policyId), "I did something wrong");
+    _policies[policyId].partnerCommission = policyInput.premium - premiumComposition.srCoc - premiumComposition.jrCoc - premiumComposition.ensuroCommission - premiumComposition.purePremium;
+    if (Policy.hash(_policies[policyId]) != _policyPool().getPolicyHash(policyId))
+      revert ShouldntHappen();
   }
+
+  function supportsInterface(
+    bytes4 interfaceId
+  )
+    public
+    view
+    virtual
+    returns (bool)
+  {
+    return
+      interfaceId == type(IPolicyHolder).interfaceId;
+  }
+
+  function onERC721Received(
+    address, // operator is the risk module that called newPolicy in the PolicyPool. Ignored for now,
+    // perhaps in the future we can check is a PriceRiskModule
+    address from,
+    uint256 tokenId,
+    bytes calldata data
+  ) external virtual override onlyPolicyPool returns (bytes4) {
+    if (from != address(0)) {
+      revert ERC721TransfersNotAllowed();
+    }
+    return IERC721Receiver.onERC721Received.selector;
+  }
+
+  function onPayoutReceived(
+    address, // riskModule, ignored
+    address, // from - Must be the PolicyPool, ignored too. Not too relevant this parameter
+    uint256 tokenId,
+    uint256 amount
+  ) external virtual override onlyPolicyPool returns (bytes4) {
+    // TODO
+    return IPolicyHolder.onPayoutReceived.selector;
+  }
+
+  function onPolicyExpired(
+    address,
+    address,
+    uint256 tokenId
+  ) external virtual override onlyPolicyPool returns (bytes4) {
+    // TODO
+    return IPolicyHolder.onPolicyExpired.selector;
+  }
+
+
 }
