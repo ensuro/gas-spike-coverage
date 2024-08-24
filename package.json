@@ -18,7 +18,7 @@
   "dependencies": {
     "@account-abstraction/contracts": "^0.7.0",
     "@ensuro/core": "^2.8.3",
-    "@ensuro/swaplibrary": "^0.2.1",
+    "@ensuro/swaplibrary": "^0.2.2",
     "@openzeppelin/contracts": "^5.0.2",
     "solidity-bytes-utils": "^0.8.2"
   }

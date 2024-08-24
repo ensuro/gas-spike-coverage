@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.4;
 
+import {IRiskModule} from "@ensuro/core/contracts/interfaces/IRiskModule.sol";
+
 interface SignedBucketRiskModule {
   type GovernanceActions is uint8;
   type Parameter is uint8;
-
-  struct Params {
-    uint256 moc;
-    uint256 jrCollRatio;
-    uint256 collRatio;
-    uint256 ensuroPpFee;
-    uint256 ensuroCocFee;
-    uint256 jrRoc;
-    uint256 srRoc;
-  }
 
   struct PolicyData {
     uint256 id;
@@ -38,7 +30,7 @@ interface SignedBucketRiskModule {
   event ComponentChanged(GovernanceActions indexed action, address value);
   event GovernanceAction(GovernanceActions indexed action, uint256 value);
   event Initialized(uint8 version);
-  event NewBucket(uint256 indexed bucketId, Params params);
+  event NewBucket(uint256 indexed bucketId, IRiskModule.Params params);
   event NewSignedPolicy(uint256 indexed policyId, bytes32 policyData);
   event Paused(address account);
   event Unpaused(address account);
@@ -54,7 +46,7 @@ interface SignedBucketRiskModule {
   function RM_PROVIDER_ROLE() external view returns (bytes32);
   function TWEAK_EXPIRATION() external view returns (uint40);
   function activeExposure() external view returns (uint256);
-  function bucketParams(uint256 bucketId) external view returns (Params memory params_);
+  function bucketParams(uint256 bucketId) external view returns (IRiskModule.Params memory params_);
   function currency() external view returns (address);
   function deleteBucket(uint256 bucketId) external;
   function exposureLimit() external view returns (uint256);
@@ -114,7 +106,7 @@ interface SignedBucketRiskModule {
     bytes32 quoteSignatureVS,
     uint40 quoteValidUntil
   ) external returns (uint256);
-  function params() external view returns (Params memory ret);
+  function params() external view returns (IRiskModule.Params memory ret);
   function pause() external;
   function paused() external view returns (bool);
   function policyPool() external view returns (address);
@@ -122,7 +114,7 @@ interface SignedBucketRiskModule {
   function proxiableUUID() external view returns (bytes32);
   function releaseExposure(uint256 payout) external;
   function resolvePolicy(PolicyData memory policy, uint256 payout) external;
-  function setBucketParams(uint256 bucketId, Params memory params_) external;
+  function setBucketParams(uint256 bucketId, IRiskModule.Params memory params_) external;
   function setParam(Parameter param, uint256 newValue) external;
   function setWallet(address wallet_) external;
   function supportsInterface(bytes4 interfaceId) external view returns (bool);

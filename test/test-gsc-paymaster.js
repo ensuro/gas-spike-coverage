@@ -21,6 +21,7 @@ const ADDRESSES = {
   ENTRYPOINT: "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
   SWAP_ROUTER: "0xE592427A0AEce92De3Edee1F18E0157C05861564",
   WETH: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+  ETH_USD_ORACLE: "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612",
 };
 
 async function setUp() {
@@ -51,12 +52,13 @@ async function setUp() {
   const ensAdmin = await ethers.getSigner(ADDRESSES.ADMINS_MULTISIG);
   await grantComponentRole(hre, access.connect(ensAdmin), rm, "PRICER_ROLE", pricer);
 
+  const oracle = await ethers.getContractAt("EACAggregatorProxy", ADDRESSES.ETH_USD_ORACLE);
   // Airdrop some USDC for tests
   const usdc = await initForkCurrency(ADDRESSES.USDC, ADDRESSES.USDCWhale, [acc1, acc2], [_A(100), _A(100)]);
 
   const FEETIER = 500;
   const swapConfig = buildUniswapConfig(_W("0.005"), FEETIER, ADDRESSES.SWAP_ROUTER);
-  const pm = await GSCPaymaster.deploy(ADDRESSES.ENTRYPOINT, rm, swapConfig, ADDRESSES.WETH, owner);
+  const pm = await GSCPaymaster.deploy(ADDRESSES.ENTRYPOINT, rm, swapConfig, ADDRESSES.WETH, oracle, owner);
 
   return {
     ep,

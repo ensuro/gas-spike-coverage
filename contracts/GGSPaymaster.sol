@@ -5,14 +5,19 @@ pragma solidity ^0.8.23;
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 import "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
 import "@account-abstraction/contracts/core/BasePaymaster.sol";
 import "@account-abstraction/contracts/core/Helpers.sol";
 
 import {SignedBucketRiskModule} from "./dependencies/ensuro/SignedBucketRiskModule.sol";
+import {IPolicyPool} from "./dependencies/ensuro/IPolicyPool.sol";
+import {IRiskModule} from "@ensuro/core/contracts/interfaces/IRiskModule.sol";
+import {Policy} from "./dependencies/ensuro/Policy.sol";
 import {SwapLibrary} from "@ensuro/swaplibrary/contracts/SwapLibrary.sol";
 import {IWETH9} from "./dependencies/uniswap-v3/IWETH9.sol";
+import {EACAggregatorProxy} from "./dependencies/chainlink/EACAggregatorProxy.sol";
 
 /// @title Sample ERC-20 Token Paymaster for ERC-4337
 /// This Paymaster covers gas fees in exchange for ERC20 tokens charged using allowance pre-issued by ERC-4337 accounts.
@@ -29,9 +34,8 @@ contract GSCPaymaster is BasePaymaster {
   using UserOperationLib for PackedUserOperation;
   using SwapLibrary for SwapLibrary.SwapConfig;
 
-  event UserOperationSponsored(address indexed user, uint256 actualGasCost);
-
-  event Received(address indexed sender, uint256 value);
+  uint256 public constant MAX_ORACLE_AGE = 3600;
+  uint256 internal constant WAD = 1e18;
 
   SignedBucketRiskModule public immutable riskModule;
 
@@ -42,21 +46,57 @@ contract GSCPaymaster is BasePaymaster {
     uint256 bar;
   }
 
-  mapping(uint256 => GasUsed) internal _gasStatus;
-  mapping(uint256 => SignedBucketRiskModule.PolicyData) internal _policies;
+  struct PolicyInput {
+    uint256 payout;
+    uint256 premium;
+    uint256 lossProb;
+    uint40 expiration;
+    uint256 bucketId;
+    bytes32 quoteSignatureR;
+    bytes32 quoteSignatureVS;
+    uint40 quoteValidUntil;
+  }
 
+  struct CoverageInput {
+    uint256 gasLimit;
+    address account;
+    uint256 prePaidGasPrice;
+    uint256 limitGasPrice;
+    uint256 reasonablePrioPerc;
+  }
+
+  mapping(uint256 => GasUsed) internal _gasStatus;
+  mapping(uint256 => Policy.PolicyData) internal _policies;
+
+  EACAggregatorProxy public oracle;
   SwapLibrary.SwapConfig public swapConfig;
   IWETH9 public immutable weth;
 
   event SwapConfigChanged(SwapLibrary.SwapConfig swapConfig);
-  
+  event UserOperationSponsored(address indexed user, uint256 actualGasCost);
+
+  event Received(address indexed sender, uint256 value);
+
+  event NewCoverage(address indexed account, CoverageInput coverage, bytes32 policyData, uint256 policyId, uint256 extraForTips);
+
+  error OraclePriceTooOld(uint256 updatedAt);
+  error NotEnoughEthPaid(uint256 premiumInEth, uint256 left);
+
   /// @notice Initializes the TokenPaymaster contract with the given parameters.
   /// @param _entryPoint The EntryPoint contract used in the Account Abstraction infrastructure.
   /// @param _riskModule The Ensuro riskModule that will cover the gas spikes
   /// @param _owner The address that will be set as the owner of the contract.
-  constructor(IEntryPoint _entryPoint, SignedBucketRiskModule _riskModule, SwapLibrary.SwapConfig memory _swapConfig, IWETH9 _weth, address _owner) BasePaymaster(_entryPoint) {
+  constructor(
+    IEntryPoint _entryPoint,
+    SignedBucketRiskModule _riskModule,
+    SwapLibrary.SwapConfig memory _swapConfig,
+    IWETH9 _weth,
+    EACAggregatorProxy _oracle,
+    address _owner
+  ) BasePaymaster(_entryPoint) {
     riskModule = _riskModule;
     weth = _weth;
+    oracle = _oracle;
     _setSwapConfig(_swapConfig);
     transferOwnership(_owner);
   }
@@ -103,5 +143,92 @@ contract GSCPaymaster is BasePaymaster {
 
   function setSwapConfig(SwapLibrary.SwapConfig memory newSwapConfig) external onlyOwner {
     _setSwapConfig(newSwapConfig);
+  }
+
+  function getPriceCurrencyinEth() public view returns (uint256 price) {
+    return Math.mulDiv(WAD, WAD, getPriceEthInCurrency());
+  }
+
+  function getPriceEthInCurrency() public view returns (uint256 price) {
+    (, int256 answer, , uint256 updatedAt, ) = oracle.latestRoundData();
+    if ((block.timestamp - updatedAt) > MAX_ORACLE_AGE) revert OraclePriceTooOld(updatedAt);
+    price = uint256(answer) * (10 ** (18 - oracle.decimals()));
+  }
+
+  function _currency() internal view returns (address) {
+    return IPolicyPool(riskModule.policyPool()).currency();
+  }
+
+  function computePolicyDataHash(CoverageInput memory coverageInput) public view returns (bytes32) {
+    return keccak256(abi.encode(block.chainid, address(this), coverageInput));
+  }
+
+  function newPolicy(PolicyInput memory policyInput, CoverageInput memory coverageInput) external payable {
+    // Get the currency() to pay the premium
+    weth.deposit{value: msg.value}();
+    uint256 premiumInEth = swapConfig.exactOutput(
+      _currency(),
+      address(weth),
+      policyInput.premium,
+      getPriceCurrencyinEth()
+    );
+    weth.withdraw(msg.value - premiumInEth);
+
+    uint256 prePaidGas = coverageInput.gasLimit * coverageInput.prePaidGasPrice;
+    if ((prePaidGas + premiumInEth) > msg.value)
+      revert NotEnoughEthPaid(premiumInEth, prePaidGas + premiumInEth - msg.value);
+    uint256 extraForTips = msg.value - prePaidGas - premiumInEth;
+    bytes32 policyData = computePolicyDataHash(coverageInput);
+    uint256 policyId = _createPolicy(policyInput, policyData);
+
+    emit NewCoverage(coverageInput.account, coverageInput, policyData, policyId, extraForTips);
+  }
+
+  function _createPolicy(PolicyInput memory policyInput, bytes32 policyData) internal returns (uint256 policyId) {
+    IERC20Metadata(_currency()).approve(riskModule.policyPool(), policyInput.premium);
+    policyId = riskModule.newPolicy(
+      policyInput.payout,
+      policyInput.premium,
+      policyInput.lossProb,
+      policyInput.expiration,
+      address(this),
+      policyData,
+      policyInput.bucketId,
+      policyInput.quoteSignatureR,
+      policyInput.quoteSignatureVS,
+      policyInput.quoteValidUntil
+    );
+    // This is to recover the full policy, since isn't returned by the risk module
+    _policies[policyId] = Policy.PolicyData({
+      id: policyId,
+      payout: policyInput.payout,
+      premium: policyInput.premium,
+      lossProb: policyInput.lossProb,
+      start: uint40(block.timestamp),
+      expiration: policyInput.expiration,
+      riskModule: IRiskModule(address(riskModule)),
+      purePremium: 0,
+      srScr: 0,
+      jrScr: 0,
+      srCoc: 0,
+      jrCoc: 0,
+      ensuroCommission: 0,
+      partnerCommission: 0
+    });
+    Policy.PremiumComposition memory premiumComposition = Policy.getMinimumPremium(
+      riskModule.bucketParams(policyInput.bucketId),
+      policyInput.payout,
+      policyInput.lossProb,
+      policyInput.expiration,
+      uint40(block.timestamp)
+    );
+    _policies[policyId].srScr = premiumComposition.srScr;
+    _policies[policyId].jrScr = premiumComposition.jrScr;
+    _policies[policyId].srCoc = premiumComposition.srCoc;
+    _policies[policyId].jrCoc = premiumComposition.jrCoc;
+    _policies[policyId].purePremium = premiumComposition.purePremium;
+    _policies[policyId].ensuroCommission = premiumComposition.ensuroCommission;
+    _policies[policyId].partnerCommission = premiumComposition.partnerCommission;
+    require(Policy.hash(_policies[policyId]) == IPolicyPool(riskModule.policyPool()).getPolicyHash(policyId), "I did something wrong");
   }
 }
