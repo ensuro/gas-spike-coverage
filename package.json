@@ -1,5 +1,5 @@
 {
-  "name": "@ensuro/account-abstraction",
+  "name": "@ensuro/gas-spike-coverage",
   "version": "0.0.1",
   "scripts": {
     "prettier": "prettier --write 'contracts/**/*.sol' --write 'test/**/*.js'",

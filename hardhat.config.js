@@ -12,6 +12,9 @@ module.exports = {
     disambiguatePaths: false,
   },
   dependencyCompiler: {
-    paths: ["@openzeppelin/contracts/interfaces/IERC20.sol"],
+    paths: [
+      "@openzeppelin/contracts/interfaces/IERC20.sol",
+      "@account-abstraction/contracts/samples/SimpleAccountFactory.sol",
+    ],
   },
 };
