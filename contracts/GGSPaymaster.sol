@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity ^0.8.23;
 
-// Import the required libraries and contracts
-import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
-import "@openzeppelin/contracts/utils/math/Math.sol";
-import "@openzeppelin/contracts/interfaces/IERC721Receiver.sol";
+/* solhint-disable no-empty-blocks */
 
-import "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
-import "@account-abstraction/contracts/core/BasePaymaster.sol";
-import "@account-abstraction/contracts/core/Helpers.sol";
+// Import the required libraries and contracts
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {IERC721Receiver} from "@openzeppelin/contracts/interfaces/IERC721Receiver.sol";
+
+import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
+import {PackedUserOperation} from "@account-abstraction/contracts/interfaces/PackedUserOperation.sol";
+import {BasePaymaster} from "@account-abstraction/contracts/core/BasePaymaster.sol";
+import {UserOperationLib} from "@account-abstraction/contracts/core/UserOperationLib.sol";
+import {_packValidationData} from "@account-abstraction/contracts/core/Helpers.sol";
 
 import {SignedBucketRiskModule} from "./dependencies/ensuro/SignedBucketRiskModule.sol";
 import {IPolicyPool} from "./dependencies/ensuro/IPolicyPool.sol";
@@ -37,15 +39,18 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
   using SwapLibrary for SwapLibrary.SwapConfig;
 
   uint256 public constant MAX_ORACLE_AGE = 3600;
+  uint256 public constant EXPIRATION_GAP = 300; // To avoid accepting policies in the simulation and reject later
   uint256 internal constant WAD = 1e18;
+  uint32 internal constant EXPIRED = 1;
 
   SignedBucketRiskModule public immutable riskModule;
 
-  // TODO: this will track the actual gas accounting
-  struct GasUsed {
+  struct GasState {
     uint32 expiration;
-    uint256 foo;
-    uint256 bar;
+    uint64 unitsLeft;
+    address account;
+    int256 reasonableLeft;
+    int256 tipsLeft;
   }
 
   struct PolicyInput {
@@ -65,9 +70,10 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
     uint256 prePaidGasPrice;
     uint256 limitGasPrice;
     uint256 reasonablePrioPerc;
+    uint256 salt;
   }
 
-  mapping(uint256 => GasUsed) internal _gasStatus;
+  mapping(uint256 => GasState) internal _gasStatus;
   mapping(uint256 => Policy.PolicyData) internal _policies;
 
   EACAggregatorProxy public oracle;
@@ -79,13 +85,26 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
 
   event Received(address indexed sender, uint256 value);
 
-  event NewCoverage(address indexed account, CoverageInput coverage, bytes32 policyData, uint256 policyId, uint256 extraForTips);
+  event NewCoverage(
+    address indexed account,
+    uint256 indexed policyId,
+    CoverageInput coverage,
+    bytes32 policyData,
+    uint256 extraForTips
+  );
+
+  event CoverageExpired(uint256 indexed policyId);
 
   error OraclePriceTooOld(uint256 updatedAt);
   error NotEnoughEthPaid(uint256 premiumInEth, uint256 left);
   error OnlyPolicyPoolCanCallThis(address msgSender);
   error ERC721TransfersNotAllowed();
+  error MustSendThePolicyId();
   error ShouldntHappen();
+  error WithdrawFailed();
+  error PolicyNotFound(uint256 policyId);
+  error PolicyExpired(uint256 policyId);
+  error CoverageExhausted(uint256 policyId);
 
   modifier onlyPolicyPool() {
     if (msg.sender != address(_policyPool())) revert OnlyPolicyPoolCanCallThis(msg.sender);
@@ -113,14 +132,23 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
 
   /// @notice Validates a paymaster user operation and calculates the required token amount for the transaction.
   /// @param userOp The user operation data.
-  /// @param requiredPreFund The maximum cost (in native token) the paymaster has to prefund.
   /// @return context The context containing the token amount and user sender address (if applicable).
   /// @return validationResult A uint256 value indicating the result of the validation (always 0 in this implementation).
   function _validatePaymasterUserOp(
     PackedUserOperation calldata userOp,
     bytes32,
-    uint256 requiredPreFund
-  ) internal override returns (bytes memory context, uint256 validationResult) {}
+    uint256 /* requiredPreFund */
+  ) internal view override returns (bytes memory context, uint256 validationResult) {
+    uint256 dataLength = userOp.paymasterAndData.length - PAYMASTER_DATA_OFFSET;
+    if (dataLength != 32) revert MustSendThePolicyId();
+    uint256 policyId = uint256(bytes32(userOp.paymasterAndData[PAYMASTER_DATA_OFFSET:PAYMASTER_DATA_OFFSET + 32]));
+    uint256 expiration = _gasStatus[policyId].expiration;
+    if (expiration == 0) revert PolicyNotFound(policyId);
+    if (expiration == EXPIRED || expiration < (block.timestamp - EXPIRATION_GAP)) revert PolicyExpired(policyId);
+    if (_gasStatus[policyId].unitsLeft == 0) revert CoverageExhausted(policyId);
+    context = abi.encode(policyId);
+    validationResult = _packValidationData(false, uint48(expiration), 0);
+  }
 
   /// @notice Performs post-operation tasks, such as updating the token price and refunding excess tokens.
   /// @dev This function is called after a user operation has been executed or reverted.
@@ -141,8 +169,9 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
   }
 
   function withdrawEth(address payable recipient, uint256 amount) external onlyOwner {
+    // TODO: perhaps this should be removed because the owner can steal users's ETH
     (bool success, ) = recipient.call{value: amount}("");
-    require(success, "withdraw failed");
+    if (!success) revert WithdrawFailed();
   }
 
   function _setSwapConfig(SwapLibrary.SwapConfig memory newSwapConfig) internal {
@@ -177,7 +206,10 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
     return keccak256(abi.encode(block.chainid, address(this), coverageInput));
   }
 
-  function newPolicy(PolicyInput memory policyInput, CoverageInput memory coverageInput) external payable {
+  function newPolicy(
+    PolicyInput memory policyInput,
+    CoverageInput memory coverageInput
+  ) external payable returns (uint256) {
     // Get the currency() to pay the premium
     weth.deposit{value: msg.value}();
     uint256 premiumInEth = swapConfig.exactOutput(
@@ -189,13 +221,24 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
     weth.withdraw(msg.value - premiumInEth);
 
     uint256 prePaidGas = coverageInput.gasLimit * coverageInput.prePaidGasPrice;
-    if ((prePaidGas + premiumInEth) > msg.value)
-      revert NotEnoughEthPaid(premiumInEth, prePaidGas + premiumInEth - msg.value);
-    uint256 extraForTips = msg.value - prePaidGas - premiumInEth;
+    int256 extraForTips = int256(msg.value) - int256(prePaidGas) - int256(premiumInEth);
+    if (extraForTips < 0) revert NotEnoughEthPaid(premiumInEth, prePaidGas + premiumInEth - msg.value);
     bytes32 policyData = computePolicyDataHash(coverageInput);
     uint256 policyId = _createPolicy(policyInput, policyData);
 
-    emit NewCoverage(coverageInput.account, coverageInput, policyData, policyId, extraForTips);
+    _gasStatus[policyId] = GasState({
+      expiration: uint32(policyInput.expiration),
+      unitsLeft: uint64(coverageInput.gasLimit),
+      tipsLeft: extraForTips,
+      account: coverageInput.account,
+      reasonableLeft: int256(prePaidGas)
+    });
+
+    // Send the ETH to the EntryPoint
+    entryPoint.depositTo{value: address(this).balance}(address(this));
+
+    emit NewCoverage(coverageInput.account, policyId, coverageInput, policyData, uint256(extraForTips));
+    return policyId;
   }
 
   function _createPolicy(PolicyInput memory policyInput, bytes32 policyData) internal returns (uint256 policyId) {
@@ -242,33 +285,30 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
     _policies[policyId].jrCoc = premiumComposition.jrCoc;
     _policies[policyId].purePremium = premiumComposition.purePremium;
     _policies[policyId].ensuroCommission = premiumComposition.ensuroCommission;
-    _policies[policyId].partnerCommission = policyInput.premium - premiumComposition.srCoc - premiumComposition.jrCoc - premiumComposition.ensuroCommission - premiumComposition.purePremium;
-    if (Policy.hash(_policies[policyId]) != _policyPool().getPolicyHash(policyId))
-      revert ShouldntHappen();
+    _policies[policyId].partnerCommission =
+      policyInput.premium -
+      premiumComposition.srCoc -
+      premiumComposition.jrCoc -
+      premiumComposition.ensuroCommission -
+      premiumComposition.purePremium;
+    if (Policy.hash(_policies[policyId]) != _policyPool().getPolicyHash(policyId)) revert ShouldntHappen();
   }
 
-  function supportsInterface(
-    bytes4 interfaceId
-  )
-    public
-    view
-    virtual
-    returns (bool)
-  {
-    return
-      interfaceId == type(IPolicyHolder).interfaceId;
+  function supportsInterface(bytes4 interfaceId) public view virtual returns (bool) {
+    return interfaceId == type(IPolicyHolder).interfaceId;
   }
 
   function onERC721Received(
-    address, // operator is the risk module that called newPolicy in the PolicyPool. Ignored for now,
+    address operator, // operator is the risk module that called newPolicy in the PolicyPool. Ignored for now,
     // perhaps in the future we can check is a PriceRiskModule
     address from,
-    uint256 tokenId,
-    bytes calldata data
+    uint256 /* tokenId */,
+    bytes calldata /* data */
   ) external virtual override onlyPolicyPool returns (bytes4) {
-    if (from != address(0)) {
+    if (from != address(0)) revert ERC721TransfersNotAllowed();
+    if (operator != address(riskModule))
+      // Only from this riskModule
       revert ERC721TransfersNotAllowed();
-    }
     return IERC721Receiver.onERC721Received.selector;
   }
 
@@ -276,9 +316,9 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
     address, // riskModule, ignored
     address, // from - Must be the PolicyPool, ignored too. Not too relevant this parameter
     uint256 tokenId,
-    uint256 amount
+    uint256 /* amount */
   ) external virtual override onlyPolicyPool returns (bytes4) {
-    // TODO
+    if (_gasStatus[tokenId].expiration == 0) revert PolicyNotFound(tokenId);
     return IPolicyHolder.onPayoutReceived.selector;
   }
 
@@ -287,9 +327,9 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
     address,
     uint256 tokenId
   ) external virtual override onlyPolicyPool returns (bytes4) {
-    // TODO
+    if (_gasStatus[tokenId].expiration == 0) revert PolicyNotFound(tokenId);
+    _gasStatus[tokenId].expiration = EXPIRED; // mark the policy as expired
+    emit CoverageExpired(tokenId);
     return IPolicyHolder.onPolicyExpired.selector;
   }
-
-
 }

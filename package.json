@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@account-abstraction/contracts": "^0.7.0",
+    "@ensuro/account-abstraction": "^0.0.1",
     "@ensuro/core": "^2.8.3",
     "@ensuro/swaplibrary": "^0.2.2",
     "@openzeppelin/contracts": "^5.0.2",

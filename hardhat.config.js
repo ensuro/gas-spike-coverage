@@ -5,7 +5,15 @@ require("hardhat-contract-sizer");
 
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
-  solidity: "0.8.24",
+  solidity: {
+    version: "0.8.24",
+    settings: {
+      optimizer: {
+        enabled: true,
+        runs: 1000,
+      },
+    },
+  },
   contractSizer: {
     alphaSort: true,
     runOnCompile: false,
@@ -15,7 +23,9 @@ module.exports = {
     paths: [
       "@openzeppelin/contracts/interfaces/IERC20.sol",
       "@account-abstraction/contracts/samples/SimpleAccountFactory.sol",
+      "@account-abstraction/contracts/core/EntryPoint.sol",
       "@ensuro/swaplibrary/contracts/SwapLibrary.sol",
+      "@ensuro/account-abstraction/contracts/AccessControlAccount.sol",
     ],
   },
 };
