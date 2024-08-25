@@ -1,0 +1,34 @@
+ul {
+  list-style-type: none;
+  padding: 0;
+}
+
+li {
+  margin-bottom: 10px;
+}
+
+.MuiTypography-h6 {
+  margin-bottom: 10px;
+  font-weight: bold;
+}
+
+@media (max-width: 768px) {
+  ul {
+    padding: 0;
+  }
+
+  li {
+    display: inline-block;
+    margin: 5px 10px;
+  }
+
+  .MuiGrid-container {
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .MuiGrid-item {
+    margin-bottom: 20px;
+    width: 100%;
+  }
+}
