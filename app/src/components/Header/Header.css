@@ -1,0 +1,22 @@
+.header {
+  background-color: #b0c4de;
+  padding: 20px;
+  text-align: center;
+}
+
+.header-title {
+  color: #ffffff;
+  font-size: 24px;
+  margin: 0;
+  font-family: 'Inter', sans-serif;
+}
+
+@media (max-width: 600px) {
+  .header {
+    padding: 15px;
+  }
+
+  .header-title {
+    font-size: 20px;
+  }
+}
