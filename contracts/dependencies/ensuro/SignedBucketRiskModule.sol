@@ -2,27 +2,11 @@
 pragma solidity ^0.8.4;
 
 import {IRiskModule} from "@ensuro/core/contracts/interfaces/IRiskModule.sol";
+import {Policy} from "./Policy.sol";
 
 interface SignedBucketRiskModule {
   type GovernanceActions is uint8;
   type Parameter is uint8;
-
-  struct PolicyData {
-    uint256 id;
-    uint256 payout;
-    uint256 premium;
-    uint256 jrScr;
-    uint256 srScr;
-    uint256 lossProb;
-    uint256 purePremium;
-    uint256 ensuroCommission;
-    uint256 partnerCommission;
-    uint256 jrCoc;
-    uint256 srCoc;
-    address riskModule;
-    uint40 start;
-    uint40 expiration;
-  }
 
   event AdminChanged(address previousAdmin, address newAdmin);
   event BeaconUpgraded(address indexed beacon);
@@ -82,18 +66,6 @@ interface SignedBucketRiskModule {
     bytes32 quoteSignatureVS,
     uint40 quoteValidUntil
   ) external returns (uint256);
-  function newPolicyFull(
-    uint256 payout,
-    uint256 premium,
-    uint256 lossProb,
-    uint40 expiration,
-    address onBehalfOf,
-    bytes32 policyData,
-    uint256 bucketId,
-    bytes32 quoteSignatureR,
-    bytes32 quoteSignatureVS,
-    uint40 quoteValidUntil
-  ) external returns (PolicyData memory createdPolicy);
   function newPolicyPaidByHolder(
     uint256 payout,
     uint256 premium,
@@ -113,7 +85,7 @@ interface SignedBucketRiskModule {
   function premiumsAccount() external view returns (address);
   function proxiableUUID() external view returns (bytes32);
   function releaseExposure(uint256 payout) external;
-  function resolvePolicy(PolicyData memory policy, uint256 payout) external;
+  function resolvePolicy(Policy.PolicyData memory policy, uint256 payout) external;
   function setBucketParams(uint256 bucketId, IRiskModule.Params memory params_) external;
   function setParam(Parameter param, uint256 newValue) external;
   function setWallet(address wallet_) external;

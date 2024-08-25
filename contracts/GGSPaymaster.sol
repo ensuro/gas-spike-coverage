@@ -40,6 +40,7 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
 
   uint256 public constant MAX_ORACLE_AGE = 3600;
   uint256 public constant EXPIRATION_GAP = 300; // To avoid accepting policies in the simulation and reject later
+  uint256 internal constant MIN_UNITS = 1000;
   uint256 internal constant WAD = 1e18;
   uint32 internal constant EXPIRED = 1;
 
@@ -51,6 +52,8 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
     address account;
     int256 reasonableLeft;
     int256 tipsLeft;
+    uint256 coverageLimit;
+    uint256 reasonablePrioPerc;
   }
 
   struct PolicyInput {
@@ -82,6 +85,7 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
 
   event SwapConfigChanged(SwapLibrary.SwapConfig swapConfig);
   event UserOperationSponsored(address indexed user, uint256 actualGasCost);
+  event CoverageTriggered(uint256 indexed policyId, uint256 coverageLimit, uint256 ethReceived);
 
   event Received(address indexed sender, uint256 value);
 
@@ -105,6 +109,7 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
   error PolicyNotFound(uint256 policyId);
   error PolicyExpired(uint256 policyId);
   error CoverageExhausted(uint256 policyId);
+  error NotYetClaimable(uint256 policyId);
 
   modifier onlyPolicyPool() {
     if (msg.sender != address(_policyPool())) revert OnlyPolicyPoolCanCallThis(msg.sender);
@@ -142,10 +147,18 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
     uint256 dataLength = userOp.paymasterAndData.length - PAYMASTER_DATA_OFFSET;
     if (dataLength != 32) revert MustSendThePolicyId();
     uint256 policyId = uint256(bytes32(userOp.paymasterAndData[PAYMASTER_DATA_OFFSET:PAYMASTER_DATA_OFFSET + 32]));
+    // Check policy exists and not expired
     uint256 expiration = _gasStatus[policyId].expiration;
     if (expiration == 0) revert PolicyNotFound(policyId);
     if (expiration == EXPIRED || expiration < (block.timestamp - EXPIRATION_GAP)) revert PolicyExpired(policyId);
-    if (_gasStatus[policyId].unitsLeft == 0) revert CoverageExhausted(policyId);
+
+    // Check still has gas - Real checks are done in _postOp
+    if (_gasStatus[policyId].unitsLeft < MIN_UNITS) revert CoverageExhausted(policyId);
+    int256 gasLeft = int256(_gasStatus[policyId].coverageLimit) +
+      _gasStatus[policyId].reasonableLeft +
+      _gasStatus[policyId].tipsLeft;
+    if (gasLeft <= 0) revert CoverageExhausted(policyId);
+
     context = abi.encode(policyId);
     validationResult = _packValidationData(false, uint48(expiration), 0);
   }
@@ -162,7 +175,28 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
     bytes calldata context,
     uint256 actualGasCost,
     uint256 actualUserOpFeePerGas
-  ) internal override {}
+  ) internal override {
+    uint256 policyId = uint256(bytes32(context));
+    uint64 unitsSpent = uint64(actualGasCost / actualUserOpFeePerGas);
+    _gasStatus[policyId].unitsLeft -= unitsSpent; // reverts if negative
+    uint256 reasonableCost = Math.min(
+      actualGasCost,
+      _reasonableGasPrice(_gasStatus[policyId].reasonablePrioPerc) * unitsSpent
+    );
+    _gasStatus[policyId].reasonableLeft -= int256(reasonableCost);
+    _gasStatus[policyId].tipsLeft -= int256(actualGasCost - reasonableCost);
+    if (_gasStatus[policyId].reasonableLeft < -int256(_gasStatus[policyId].coverageLimit)) {
+      revert CoverageExhausted(policyId);
+    }
+    // For now we fail when tips are exhausted. In the future we might use the reasonableLeft if any
+    if (_gasStatus[policyId].tipsLeft < 0) {
+      revert CoverageExhausted(policyId);
+    }
+  }
+
+  function _reasonableGasPrice(uint256 reasonablePrioPerc) internal returns (uint256) {
+    return Math.mulDiv(block.basefee, WAD + reasonablePrioPerc, WAD);
+  }
 
   receive() external payable {
     emit Received(msg.sender, msg.value);
@@ -231,7 +265,9 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
       unitsLeft: uint64(coverageInput.gasLimit),
       tipsLeft: extraForTips,
       account: coverageInput.account,
-      reasonableLeft: int256(prePaidGas)
+      reasonableLeft: int256(prePaidGas),
+      coverageLimit: coverageInput.gasLimit * (coverageInput.limitGasPrice - coverageInput.prePaidGasPrice),
+      reasonablePrioPerc: coverageInput.reasonablePrioPerc
     });
 
     // Send the ETH to the EntryPoint
@@ -294,6 +330,19 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
     if (Policy.hash(_policies[policyId]) != _policyPool().getPolicyHash(policyId)) revert ShouldntHappen();
   }
 
+  function claim(uint256 policyId) public {
+    if (_policies[policyId].id == 0) revert PolicyNotFound(policyId);
+    if (_policies[policyId].expiration >= block.timestamp) revert PolicyExpired(policyId);
+    if (_policyPool().getPolicyHash(policyId) == bytes32(0)) revert PolicyExpired(policyId); // Already claimed
+    if (_gasStatus[policyId].reasonableLeft >= 0) revert NotYetClaimable(policyId);
+    uint256 payoutInUSD = Math.max(
+      Math.mulDiv(_gasStatus[policyId].coverageLimit, getPriceEthInCurrency(), WAD),
+      _policies[policyId].payout
+    );
+    // payoutInUSD in doesn't consider the slippage, that will reduce a bit the ETH received
+    riskModule.resolvePolicy(_policies[policyId], payoutInUSD);
+  }
+
   function supportsInterface(bytes4 interfaceId) public view virtual returns (bool) {
     return interfaceId == type(IPolicyHolder).interfaceId;
   }
@@ -316,9 +365,18 @@ contract GSCPaymaster is BasePaymaster, IPolicyHolder {
     address, // riskModule, ignored
     address, // from - Must be the PolicyPool, ignored too. Not too relevant this parameter
     uint256 tokenId,
-    uint256 /* amount */
+    uint256 amount
   ) external virtual override onlyPolicyPool returns (bytes4) {
     if (_gasStatus[tokenId].expiration == 0) revert PolicyNotFound(tokenId);
+    // Get the currency() to pay the premium
+    uint256 ethReceived = swapConfig.exactInput(_currency(), address(weth), amount, getPriceEthInCurrency());
+    weth.withdraw(ethReceived);
+    entryPoint.depositTo{value: address(this).balance}(address(this));
+
+    // Update the limit in _gasStatus to reflect that we might get a bit less because of slippage
+    emit CoverageTriggered(tokenId, _gasStatus[tokenId].coverageLimit, ethReceived);
+    _gasStatus[tokenId].coverageLimit = ethReceived;
+
     return IPolicyHolder.onPayoutReceived.selector;
   }
 
