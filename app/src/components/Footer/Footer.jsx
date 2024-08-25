@@ -9,25 +9,43 @@ const Footer = () => {
         <Grid item xs={12} sm={3} md={3}>
           <Typography variant="h6">Use cases</Typography>
           <ul>
-            <li>UI design</li>
-            <li>UX design</li>
-            <li>Wireframing</li>
+            <li>
+              <a href="/#">Gas Price Tracker</a>
+            </li>
+            <li>
+              <a href="/#">Understanding Gas Fees</a>
+            </li>
+            <li>
+              <a href="/#">Gas Savings Tips</a>
+            </li>
           </ul>
         </Grid>
         <Grid item xs={12} sm={3} md={3}>
-          <Typography variant="h6">Explore</Typography>
+          <Typography variant="h6">Blockchain Tools</Typography>
           <ul>
-            <li>Design</li>
-            <li>Prototyping</li>
-            <li>Development features</li>
+            <li>
+              <a href="/#">Block Explorer</a>
+            </li>
+            <li>
+              <a href="/#">Ethereum</a>
+            </li>
+            <li>
+              <a href="/#">ERC20</a>
+            </li>
           </ul>
         </Grid>
         <Grid item xs={12} sm={3} md={3}>
-          <Typography variant="h6">Resources</Typography>
+          <Typography variant="h6">Support & Contact</Typography>
           <ul>
-            <li>Blog</li>
-            <li>Best practices</li>
-            <li>Colors</li>
+            <li>
+              <a href="/#">FAQs</a>
+            </li>
+            <li>
+              <a href="/#">Contact Us</a>
+            </li>
+            <li>
+              <a href="/#">Community Forum</a>
+            </li>
           </ul>
         </Grid>
       </Grid>
