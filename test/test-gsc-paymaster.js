@@ -1,13 +1,13 @@
 const { expect } = require("chai");
 const {
   _W,
-  getRole,
   amountFunction,
   getAddress,
   grantComponentRole,
   defaultPolicyParams,
   makeSignedQuote,
   makeBucketQuoteMessage,
+  getTransactionEvent,
 } = require("@ensuro/core/js/utils");
 const { setupChain, initForkCurrency } = require("@ensuro/core/js/test-utils");
 const { buildUniswapConfig } = require("@ensuro/swaplibrary/js/utils");
@@ -39,7 +39,9 @@ const ORACLE_TO_WAD = 10n ** 10n;
 async function setUp() {
   const [, eoa1, eoa2, anon, owner, pricer] = await ethers.getSigners();
 
-  const ep = await ethers.getContractAt("IEntryPoint", ADDRESSES.ENTRYPOINT);
+  const EntryPoint = await ethers.getContractFactory("EntryPoint");
+  const ep = await EntryPoint.deploy();
+  // await ethers.getContractAt("IEntryPoint", ADDRESSES.ENTRYPOINT);
 
   // SwapLibrary setup
   const SwapLibrary = await ethers.getContractFactory("SwapLibrary");
@@ -49,12 +51,9 @@ async function setUp() {
   const GSCPaymaster = await ethers.getContractFactory("GSCPaymaster", { libraries: { SwapLibrary: swapAddr } });
 
   // Setup some accounts
-  const SimpleAccountFactory = await ethers.getContractFactory("SimpleAccountFactory");
-  const simpleAccFactory = await SimpleAccountFactory.deploy(ADDRESSES.ENTRYPOINT);
-  await simpleAccFactory.createAccount(eoa1, 0);
-  await simpleAccFactory.createAccount(eoa2, 0);
-  const acc1 = await ethers.getContractAt("SimpleAccount", await simpleAccFactory.getAddress(eoa1, 0));
-  const acc2 = await ethers.getContractAt("SimpleAccount", await simpleAccFactory.getAddress(eoa2, 0));
+  const AccessControlAccount = await ethers.getContractFactory("AccessControlAccount");
+  const acc1 = await AccessControlAccount.deploy(ep, eoa1, [eoa1]);
+  const acc2 = await AccessControlAccount.deploy(ep, eoa2, [eoa2]);
   // Setup Ensuro permissions
   const pool = await ethers.getContractAt("IPolicyPool", ADDRESSES.POOL);
   const access = await ethers.getContractAt("IAccessManager", ADDRESSES.ACCESSMANAGER);
@@ -70,7 +69,7 @@ async function setUp() {
 
   const FEETIER = 500;
   const swapConfig = buildUniswapConfig(_W("0.01"), FEETIER, ADDRESSES.SWAP_ROUTER);
-  const pm = await GSCPaymaster.deploy(ADDRESSES.ENTRYPOINT, rm, swapConfig, ADDRESSES.WETH, oracle, owner);
+  const pm = await GSCPaymaster.deploy(ep, rm, swapConfig, ADDRESSES.WETH, oracle, owner);
 
   await grantComponentRole(hre, access.connect(ensAdmin), rm, "POLICY_CREATOR_ROLE", pm);
   await grantComponentRole(hre, access.connect(ensAdmin), rm, "RESOLVER_ROLE", pm);
@@ -78,8 +77,7 @@ async function setUp() {
   return {
     ep,
     GSCPaymaster,
-    SimpleAccountFactory,
-    simpleAccFactory,
+    AccessControlAccount,
     pool,
     rm,
     access,
@@ -97,6 +95,28 @@ async function setUp() {
   };
 }
 
+function makeCoverageInput(acc, erc20count = 20n, prePaid = "0.5", limit = "1.5", salt = 0) {
+  const gasLimit = ERC20_TRANSFER_GAS * erc20count;
+  const prePaidGasPrice = ethers.parseUnits(prePaid, "gwei");
+  const limitGasPrice = ethers.parseUnits(limit, "gwei");
+  const reasonablePrioPerc = _W("0.1");
+
+  return [gasLimit, acc, prePaidGasPrice, limitGasPrice, reasonablePrioPerc, salt];
+}
+
+async function computePayout(coverageInput, oracle) {
+  const appreciationFactor = _W("1.2");
+  const [gasLimit, , prePaidGasPrice, limitGasPrice] = coverageInput;
+  const payout = ((limitGasPrice - prePaidGasPrice) * gasLimit * appreciationFactor) / _W(1);
+  const price = (await oracle.latestRoundData()).answer * ORACLE_TO_WAD;
+  return (payout * price) / _W(1) / 10n ** 12n;
+}
+
+function ethToSend(coverageInput, premiunInEth) {
+  const [gasLimit, , prePaidGasPrice] = coverageInput;
+  return prePaidGasPrice * gasLimit + premiunInEth + (premiunInEth * _W("0.05")) / _W(1);
+}
+
 describe("GSCPaymaster contract tests", function () {
   before(async () => {
     await setupChain(246353581);
@@ -109,19 +129,11 @@ describe("GSCPaymaster contract tests", function () {
   });
 
   it("Creates a policy", async () => {
-    const { usdc, pool, pm, eoa1, acc1, rm, oracle, pricer } = await helpers.loadFixture(setUp);
-    const gasLimit = ERC20_TRANSFER_GAS * 20n;
-    const prePaidGasPrice = ethers.parseUnits("0.5", "gwei");
-    const limitGasPrice = ethers.parseUnits("1.5", "gwei");
-    const appreciationFactor = _W("1.2");
-    const reasonablePrioPerc = _W("0.1");
+    const { usdc, pool, pm, eoa1, acc1, acc2, rm, oracle, pricer, anon, ep } = await helpers.loadFixture(setUp);
 
-    const coverageInput = [gasLimit, acc1, prePaidGasPrice, limitGasPrice, reasonablePrioPerc];
-
+    const coverageInput = makeCoverageInput(acc1);
     const policyData = await pm.computePolicyDataHash(coverageInput);
-    const payout = ((limitGasPrice - prePaidGasPrice) * gasLimit * appreciationFactor) / _W(1);
-    const price = (await oracle.latestRoundData()).answer * ORACLE_TO_WAD;
-    const payoutInUSDC = (payout * price) / _W(1) / 10n ** 12n;
+    const payoutInUSDC = await computePayout(coverageInput, oracle);
     const premium = _A(1);
     const lossProb = _W("0.05");
 
@@ -141,8 +153,52 @@ describe("GSCPaymaster contract tests", function () {
     ];
 
     const premiunInEth = await pm.getPriceCurrencyInEth();
-    const ethToSend = prePaidGasPrice * gasLimit + premiunInEth + (premiunInEth * _W("0.05")) / _W(1);
+    const tx = await pm
+      .connect(eoa1)
+      .newPolicy(policyInput, coverageInput, { value: ethToSend(coverageInput, premiunInEth) });
+    const receipt = await tx.wait();
+    const newPolicyEvt = getTransactionEvent(pool.interface, receipt, "NewPolicy");
+    const policyId = newPolicyEvt.args.policy.id;
+    console.log(policyId);
 
-    await pm.connect(eoa1).newPolicy(policyInput, coverageInput, { value: ethToSend });
+    const transferCall = usdc.interface.encodeFunctionData("transfer", [getAddress(acc2), _A(3)]);
+    const executeCall = acc1.interface.encodeFunctionData("execute", [getAddress(usdc), 0, transferCall]);
+    const nonce = await ep.getNonce(acc1, 0);
+    const userOpObj = {
+      sender: getAddress(acc1),
+      nonce: nonce,
+      initCode: "0x",
+      callData: executeCall,
+      callGasLimit: ERC20_TRANSFER_GAS,
+      verificationGasLimit: ERC20_TRANSFER_GAS,
+      preVerificationGas: ERC20_TRANSFER_GAS,
+      paymasterVerificationGasLimit: ERC20_TRANSFER_GAS,
+      paymasterPostOpGasLimit: ERC20_TRANSFER_GAS,
+      maxFeePerGas: ethers.parseUnits("0.02", "gwei"),
+      maxPriorityFeePerGas: ethers.parseUnits("0.02", "gwei"),
+      paymaster: getAddress(pm),
+      paymasterData: ethers.AbiCoder.defaultAbiCoder().encode(["uint256"], [policyId]),
+      paymasterVerificationGasLimit: ERC20_TRANSFER_GAS,
+      paymasterPostOpGasLimit: ERC20_TRANSFER_GAS,
+      signature: "0x",
+    };
+    console.log(userOpObj);
+    const { chainId } = await hre.ethers.provider.getNetwork();
+    const userOpHash = getUserOpHash(userOpObj, getAddress(ep), chainId);
+    const userOp = packedUserOpAsArray(packUserOp(userOpObj), false);
+    const userOpHash2 = await ep.getUserOpHash([...userOp, ethers.toUtf8Bytes("")]);
+    expect(userOpHash).to.be.equal(userOpHash2);
+
+    // Sign the hash
+    const message = userOpHash;
+    const aaSignature = await eoa1.signMessage(ethers.getBytes(message));
+    const prevBalance = await usdc.balanceOf(acc1);
+    await expect(() => ep.handleOps([[...userOp, aaSignature]], anon)).to.changeTokenBalances(
+      usdc,
+      [acc1, acc2],
+      [_A(-3), _A(3)]
+    );
+    const postBalance = await usdc.balanceOf(acc1);
+    expect(prevBalance - postBalance).to.equal(_A(3));
   });
 });

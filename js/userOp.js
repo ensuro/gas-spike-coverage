@@ -7,6 +7,12 @@ function packAccountGasLimits(verificationGasLimit, callGasLimit) {
   return ethers.toBeHex(verificationGasLimit, 16) + ethers.toBeHex(callGasLimit, 16).slice(2);
 }
 
+function packPaymasterData(paymaster, paymasterVerificationGasLimit, postOpGasLimit, paymasterData) {
+  return (
+    paymaster + packAccountGasLimits(paymasterVerificationGasLimit, postOpGasLimit).slice(2) + paymasterData.slice(2)
+  );
+}
+
 function packUserOp(userOp) {
   const accountGasLimits = packAccountGasLimits(userOp.verificationGasLimit, userOp.callGasLimit);
   const gasFees = packAccountGasLimits(userOp.maxPriorityFeePerGas, userOp.maxFeePerGas);
